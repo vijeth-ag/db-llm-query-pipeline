@@ -1,0 +1,22 @@
+version: '3.7'
+
+services:
+  mongo:
+    image: mongo:6.0
+    networks:
+      - db-llm-query-network    
+    container_name: mongo
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: password
+    ports:
+      - "27017:27017"
+    command: >
+      mongod --replSet rs0 --auth --keyFile /data/keyfile
+    volumes:
+      - ./dataset:/dataset
+      - ./keyFile:/data/keyfile
+
+networks:
+  db-llm-query-network:
+    external: true

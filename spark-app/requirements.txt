@@ -1,0 +1,4 @@
+pyspark
+pymilvus==2.4.4
+openai
+requests

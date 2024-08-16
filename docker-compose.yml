@@ -1,0 +1,203 @@
+version: '2'
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    networks:
+      - db-llm-query-network
+    container_name: zookeeper
+    ports:
+      - 2181:2181
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka
+    networks:
+      - db-llm-query-network    
+    depends_on:
+      - zookeeper
+    ports:
+      - 9092:9092 
+    volumes:
+      - streaming_data:/data:rw
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://127.0.0.1:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  kafka-topic-creator:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka-topic-creator
+    networks:
+      - db-llm-query-network
+    depends_on:
+      - kafka
+    entrypoint: >
+      bash -c "
+      sleep 30 &&
+      /bin/kafka-topics --create --topic mongo-topic-.people_db.people_coll --bootstrap-server kafka:29092 --partitions 1 --replication-factor 1"
+    volumes:
+      - streaming_data:/data:rw            
+
+  control-center:
+    image: confluentinc/cp-enterprise-control-center:7.5.0
+    networks:
+      - db-llm-query-network    
+    hostname: control-center
+    container_name: control-center
+    depends_on:
+      - kafka
+      - kafka-connect
+    ports:
+      - "9021:9021"
+    environment:
+      CONTROL_CENTER_BOOTSTRAP_SERVERS: 'kafka:29092'
+      CONTROL_CENTER_CONNECT_CONNECT-DEFAULT_CLUSTER: 'kafka-connect:8083'
+      # CONTROL_CENTER_KSQL_KSQLDB1_URL: "http://ksqldb-server:8088"
+      # CONTROL_CENTER_KSQL_KSQLDB1_ADVERTISED_URL: "http://localhost:8088"
+      # CONTROL_CENTER_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+      CONTROL_CENTER_REPLICATION_FACTOR: 1
+      CONTROL_CENTER_INTERNAL_TOPICS_PARTITIONS: 1
+      CONTROL_CENTER_MONITORING_INTERCEPTOR_TOPIC_PARTITIONS: 1
+      CONFLUENT_METRICS_TOPIC_REPLICATION: 1
+      PORT: 9021  
+
+  kafka-connect:
+    image: confluentinc/cp-kafka-connect:latest
+    networks:
+      - db-llm-query-network    
+    container_name: kafka-connect
+    depends_on:
+      - kafka
+    ports:
+      - 8083:8083   
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: kafka:29092
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_GROUP_ID: compose-connect-group
+      CONNECT_CONFIG_STORAGE_TOPIC: docker-connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: docker-connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: docker-connect-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_INTERNAL_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_INTERNAL_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_REST_PORT: 8083
+      CONNECT_PLUGIN_PATH: /usr/share/java,/etc/kafka-connect/jars
+      CONNECT_MONGODB_HOSTS: "mongo:27017"
+      CONNECT_MONGODB_USER: "root"
+      CONNECT_MONGODB_PASSWORD: "password"
+      CONNECT_MONGODB_DATABASE: "people_db"
+      CONNECT_MONGODB_COLLECTION: "people_coll"
+      CONNECT_MONGODB_NAME: "mongo-source-connector"
+      CONNECT_MONGODB_TASKS_MAX: 1
+      CONNECT_MONGODB_POLL_INTERVAL_MS: 5000
+      CONNECT_MONGODB_OUTPUT_TOPIC: "mongo-topic"
+      CONNECT_MONGODB_DOCUMENT_ID_STRATEGIES: "com.mongodb.kafka.connect.source.json.formatter.JsonDocumentIdStrategy"
+    volumes:
+      - ./connectors:/etc/kafka-connect/jars  # Add this line to mount the connectors directory
+
+  spark-app:
+    container_name: spark-app
+    build: spark-app
+    networks:
+      - db-llm-query-network    
+    depends_on:
+    - kafka
+    - kafka-connect
+    environment:
+      SPARK_UI_PORT: 4040
+    entrypoint: 
+      - spark-submit
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.0
+      - /app/ingest-processor.py
+    volumes:
+      - ./spark-app:/app
+
+  etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.0
+    networks:
+      - db-llm-query-network        
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+    volumes:
+      - ./data/milvus/etcd:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+
+  minio:
+    container_name: milvus-minio
+    image: minio/minio:RELEASE.2020-12-03T00-03-10Z
+    networks:
+      - db-llm-query-network        
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - ./data/milvus/minio:/minio_data
+    command: minio server /minio_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  milvus-standalone:
+    container_name: milvus-standalone
+    image: milvusdb/milvus:v2.4.6
+    networks:
+      - db-llm-query-network        
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      - ./data/milvus:/var/lib/milvus
+    ports:
+      - "19530:19530"
+    depends_on:
+      - "etcd"
+      - "minio"
+
+  attu:
+    container_name: attu
+    image: zilliz/attu:v2.2.8
+    networks:
+      - db-llm-query-network        
+    environment:
+      MILVUS_URL: milvus-standalone:19530
+    ports:
+      - "8000:3000"
+    depends_on:
+      - "milvus-standalone"
+
+  streamlit:
+    container_name: streamlit
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - .:/app
+      - ./data/unprocessed:/data/unprocessed
+    environment:
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+    command: ["streamlit", "run", "./app/app-ui.py"]
+    
+volumes:
+  streaming_data:
+
+networks:
+  db-llm-query-network:
+    external: true
