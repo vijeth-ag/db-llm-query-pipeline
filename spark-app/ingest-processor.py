@@ -1,21 +1,7 @@
-# spark job to observe kafka topic and process incoming data
-
 import json
-import os
+import requests
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, expr
-from vector.embedding import encode
-from vector.vec_db import init_db
-from vector.vec_db import store_embeddings
-
-# from functools import wraps
-# from pymilvus import connections, utility, db, MilvusClient, FieldSchema, CollectionSchema, Collection, DataType
-# from openai import OpenAI
-# import time
-
-model_id = "sentence-transformers/all-MiniLM-L6-v2"
-
-init_db()
 
 # Initialize Spark session
 spark = SparkSession.builder \
@@ -26,12 +12,9 @@ spark = SparkSession.builder \
     .config('spark.jars.packages', 'org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.0') \
     .getOrCreate()
 
-# spark.sparkContext.setLogLevel("WARN")
-# set spark log level to error onlu
 spark.sparkContext.setLogLevel("ERROR")
 
-
-print("spark:",spark)
+print("spark:", spark)
 
 # Read raw data from Kafka
 kafka_df = spark.readStream \
@@ -41,42 +24,51 @@ kafka_df = spark.readStream \
     .option("startingOffsets", "earliest") \
     .load()
 
-# kafka_string_df = kafka_df.selectExpr("CAST(value AS STRING)")
-
-# # Process data
-def process(data):
-    # print("processing data", type(data))
-    process_row(data)
-
-
-def process_row(row):
-    row_values = row.asDict().values()
-    byte_arrays = [item for item in row_values if isinstance(item, bytearray)]
-
-    documents = []
-    for byte_array in byte_arrays:
-        json_str = byte_array.decode('utf-8')
-        parsed_json = json.loads(json_str)
-        payload_str = parsed_json.get('payload', None)
+# Function to send data to the API
+def send_to_api(documents):
+    print(len(documents))
+    url = "http://db-service:5123/store"  # Replace with your API endpoint
+    headers = {"Content-Type": "application/json"}
+    
+    for doc in documents:
+        # Convert the document to JSON string
+        payload = json.dumps({
+            "data": str(doc)
+        })
         
-        # If payload is present, parse it to get the actual MongoDB document
-        if payload_str:
-            mongo_doc = json.loads(payload_str)
-            documents.append(mongo_doc)
+        # Send the document to the API
+        response = requests.post(url, data=payload, headers=headers)
+        
+        if response.status_code == 200:
+            print(f"Successfully stored document: {doc}")
+        else:
+            print(f"Failed to store document: {doc}, Status Code: {response.status_code}, Error: {response.text}")
+
+# Process function to extract and send documents to the API
+def process_row(df_spark, epoch_id):
+
+    df_spark.show()
+
+    # Parse Kafka message value as string and extract relevant fields
+    df_spark = df_spark.selectExpr("CAST(value AS STRING) as json_str")
+    df_spark.show(truncate=False)
+
+    # Parse JSON and extract payloads
+    df_spark = df_spark.withColumn("parsed_json", expr("from_json(json_str, 'payload STRING')"))
+    df_spark = df_spark.withColumn("payload", col("parsed_json.payload"))
 
 
-    # Output the extracted MongoDB documents
-    for i, doc in enumerate(documents, start=1):
-        full_document = doc.get('fullDocument')
-        if full_document:            
-            embedded_doc = encode(str(full_document))
-            # print(f"embedded_doc: {embedded_doc}")
-            print("...............storing.....")
-            store_embeddings(embedded_doc, str(full_document))
-            
-           
+    # Extract and collect the MongoDB documents
+    df_spark = df_spark.withColumn("mongo_doc", expr("from_json(payload, 'fullDocument MAP<STRING,STRING>')"))
+    documents = df_spark.select("mongo_doc").collect()
 
+    # Convert Row objects to dictionaries for sending to the API
+    documents_dicts = [row.mongo_doc.asDict() for row in documents]
 
-query = kafka_df.writeStream.foreach(process).start()
+    # Send the documents to the API
+    send_to_api(documents_dicts)
+
+# Apply process_row to each micro-batch using foreachBatch
+query = kafka_df.writeStream.foreachBatch(process_row).start()
 
 query.awaitTermination()

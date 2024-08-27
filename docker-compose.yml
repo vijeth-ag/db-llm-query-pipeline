@@ -184,17 +184,41 @@ services:
 
   streamlit:
     container_name: streamlit
-    build: .
+    build: ./ui
+    networks:
+      - db-llm-query-network    
     ports:
       - "8501:8501"
-    volumes:
-      - .:/app
-      - ./data/unprocessed:/data/unprocessed
     environment:
       - STREAMLIT_SERVER_PORT=8501
       - STREAMLIT_SERVER_ADDRESS=0.0.0.0
-    command: ["streamlit", "run", "./app/app-ui.py"]
-    
+      - PYTHONUNBUFFERED=1
+
+  db-service:
+    container_name: db-service
+    build: ./db
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks:
+      - db-llm-query-network
+    ports:
+      - "5123:5123"
+    volumes:
+      - ./db/data:/data
+
+  query-server:
+    container_name: query-server
+    build: ./query-server/app
+    environment:
+      - PYTHONUNBUFFERED=1    
+    networks:
+      - db-llm-query-network
+    ports:
+      - "8123:8123"
+    volumes:
+      - ./query-server/app:/app
+
+
 volumes:
   streaming_data:
 
